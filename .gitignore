@@ -1,0 +1,9 @@
+*.exe
+*.log
+node_modules/
+dist/
+client/browser/node_modules/
+*.lock
+.DS_Store
+.env
+.vscode/

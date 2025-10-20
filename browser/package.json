@@ -1,0 +1,16 @@
+{
+  "name": "httpe-browser",
+  "version": "0.1.0",
+  "description": "Tiny Electron browser with built-in HTTPE protocol support (OpenPGP)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "node-fetch": "^2.6.7",
+    "openpgp": "^5.8.0"
+  },
+  "devDependencies": {
+    "electron": "^26.6.10"
+  }
+}

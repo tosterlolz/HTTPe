@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HTTPE Browser</title>
+  <style>
+    body{font-family:Arial, sans-serif}
+    #controls{padding:8px}
+    #nav{margin-bottom:8px}
+    #frame{width:100%; height:80vh; border:1px solid #ccc}
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input id="url" type="text" value="httpe://localhost/" style="width:70%">
+    <button id="go">Go</button>
+  </div>
+  <iframe id="frame"></iframe>
+
+  <script>
+    const urlInput = document.getElementById('url')
+    const go = document.getElementById('go')
+    const frame = document.getElementById('frame')
+
+    go.addEventListener('click', () => {
+      const u = urlInput.value
+      // load via registered protocol
+      frame.src = u
+    })
+  </script>
+</body>
+</html>
