@@ -13,27 +13,100 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/openpgp"
-	"golang.org/x/term"
 )
 
 func main() {
 	var keysDir string
 	var port int
+	var passphrase string
 	flag.StringVar(&keysDir, "keys", "", "directory to load PGP keys from (overrides relative paths)")
 	flag.IntVar(&port, "port", 553, "port to listen on (default 553)")
+	flag.StringVar(&passphrase, "passphrase", "", "PGP passphrase (non-interactive)")
 	flag.Parse()
 	if keysDir != "" {
 		os.Setenv("KEYS_DIR", keysDir)
 	}
 
-	http.HandleFunc("/", handleHTTPE)
-	fmt.Printf("HTTPE server listening on :%d\n", port)
-	http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+	// If passphrase provided on CLI, use it (non-interactive)
+	if passphrase != "" {
+		cachedPass = passphrase
+		passLoaded = true
+	}
+
+	// Load .env non-destructively (if present) - prefer ./.well-known/httpe/.env then ./server/.env then ./ .env
+	tryPaths := []string{".well-known/httpe/.env", ".env"}
+	for _, p := range tryPaths {
+		if b, err := os.ReadFile(p); err == nil {
+			lines := strings.Split(string(b), "\n")
+			for _, ln := range lines {
+				ln = strings.TrimSpace(ln)
+				if ln == "" || strings.HasPrefix(ln, "#") {
+					continue
+				}
+				parts := strings.SplitN(ln, "=", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				k := strings.TrimSpace(parts[0])
+				v := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+				if os.Getenv(k) == "" {
+					os.Setenv(k, v)
+				}
+			}
+			break
+		}
+	}
+
+	httpDisabled := os.Getenv("HTTPE_NO_HTTP") == "true"
+
+	if !httpDisabled {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "GET" {
+				// Serve index.html from server directory
+				http.ServeFile(w, r, "index.html")
+				return
+			}
+			handleHTTPE(w, r)
+		})
+	} else {
+		fmt.Println("HTTP serving disabled (HTTPE_NO_HTTP=true). Only TCP protocol will be available.")
+	}
+
+	// Start a local-only TCP protocol server to serve index.html and accept HTTPE framed requests
+	tcpPort := os.Getenv("HTTPE_TCP_PORT")
+	if tcpPort == "" {
+		tcpPort = "127.0.0.1:5533"
+	}
+	if err := startTCPServer(tcpPort); err != nil {
+		fmt.Println("Failed to start TCP server:", err)
+	}
+
+	if httpDisabled {
+		// Block forever (or until process killed) while TCP server runs in background goroutine
+		select {}
+	}
+
+	// By default bind HTTP to loopback to avoid exposing the server to the clear web.
+	// Set HTTPE_PUBLIC=true in environment to listen on all interfaces (not recommended for privacy).
+	listenAddr := "127.0.0.1"
+	if os.Getenv("HTTPE_PUBLIC") == "true" {
+		listenAddr = ""
+	}
+	addr := fmt.Sprintf("%s:%d", listenAddr, port)
+	fmt.Printf("HTTPE server listening on %s\n", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		fmt.Println("HTTP server error:", err)
+	}
 }
 
 func handleHTTPE(w http.ResponseWriter, r *http.Request) {
 	// Load server (private) key
-	serverEntity := loadEntity(resolveKeyPath("../keys/server_priv.asc"))
+	serverEntity, err := loadEntity(resolveKeyPath("../keys/server_priv.asc"))
+	if err != nil {
+		http.Error(w, "server private key error: "+err.Error(), http.StatusInternalServerError)
+		fmt.Println("[ERROR] server private key error:", err)
+		return
+	}
 
 	// Load client (public) key - try local file first, then attempt to fetch from the client host and cache it
 	clientKeyPath := resolveKeyPath("../keys/client_pub.asc")
@@ -56,7 +129,16 @@ func handleHTTPE(w http.ResponseWriter, r *http.Request) {
 	ciphertext, _ := io.ReadAll(r.Body)
 	defer r.Body.Close()
 
-	md, err := openpgp.ReadMessage(bytes.NewReader(ciphertext), openpgp.EntityList{serverEntity}, nil, nil)
+	fmt.Printf("[Server] Request from %s %s, Content-Type=%s, Content-Length=%d\n", r.RemoteAddr, r.Method, r.Header.Get("Content-Type"), len(ciphertext))
+	if len(ciphertext) == 0 {
+		http.Error(w, "empty request body", http.StatusBadRequest)
+		return
+	}
+
+	// Provide both the server's private entity (to decrypt) and the client's public entity
+	// (to verify the signature). ReadMessage will use available keys for decryption and
+	// signature verification.
+	md, err := openpgp.ReadMessage(bytes.NewReader(ciphertext), openpgp.EntityList{serverEntity, clientEntity}, nil, nil)
 	if err != nil {
 		http.Error(w, "Decryption error: "+err.Error(), 400)
 		return
@@ -80,7 +162,7 @@ func handleHTTPE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prepare the response
-	response := []byte(fmt.Sprintf("%s", string(plaintext)))
+	response := []byte(string(plaintext))
 
 	var out bytes.Buffer
 	err = openpgp.ArmoredDetachSign(&out, serverEntity, bytes.NewReader(response), nil)
@@ -174,15 +256,18 @@ func fetchAndCacheClientPub(host, destPath string) (*openpgp.Entity, error) {
 	return nil, lastErr
 }
 
-func loadEntity(path string) *openpgp.Entity {
+func loadEntity(path string) (*openpgp.Entity, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("open key file %s: %w", path, err)
 	}
 	defer f.Close()
 	entityList, err := openpgp.ReadArmoredKeyRing(f)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("read keyring %s: %w", path, err)
+	}
+	if len(entityList) == 0 {
+		return nil, fmt.Errorf("no entity in keyring %s", path)
 	}
 	e := entityList[0]
 
@@ -190,11 +275,11 @@ func loadEntity(path string) *openpgp.Entity {
 	if e.PrivateKey != nil && e.PrivateKey.Encrypted {
 		if pass != "" {
 			if err := e.PrivateKey.Decrypt([]byte(pass)); err != nil {
-				panic(fmt.Errorf("failed to decrypt private key %s: %w", path, err))
+				return nil, fmt.Errorf("failed to decrypt private key %s: %w", path, err)
 			}
 		} else {
 			if err := e.PrivateKey.Decrypt([]byte("")); err != nil {
-				panic(fmt.Errorf("private key %s is encrypted; set PGP_PASSPHRASE environment variable to the passphrase: %w", path, err))
+				return nil, fmt.Errorf("private key %s is encrypted; set PGP_PASSPHRASE environment variable to the passphrase: %w", path, err)
 			}
 		}
 	}
@@ -203,17 +288,17 @@ func loadEntity(path string) *openpgp.Entity {
 		if sub.PrivateKey != nil && sub.PrivateKey.Encrypted {
 			if pass != "" {
 				if err := sub.PrivateKey.Decrypt([]byte(pass)); err != nil {
-					panic(fmt.Errorf("failed to decrypt subkey in %s: %w", path, err))
+					return nil, fmt.Errorf("failed to decrypt subkey in %s: %w", path, err)
 				}
 			} else {
 				if err := sub.PrivateKey.Decrypt([]byte("")); err != nil {
-					panic(fmt.Errorf("encrypted subkey in %s; set PGP_PASSPHRASE environment variable: %w", path, err))
+					return nil, fmt.Errorf("encrypted subkey in %s; set PGP_PASSPHRASE environment variable: %w", path, err)
 				}
 			}
 		}
 	}
 
-	return e
+	return e, nil
 }
 
 // resolveKeyPath tries the given path first, then looks in KEYS_DIR, then next to the executable.
@@ -250,15 +335,28 @@ func getCachedPassphrase() string {
 		passLoaded = true
 		return cachedPass
 	}
-	// interactive prompt
-	fmt.Print("Enter PGP passphrase (empty for none): ")
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	if err == nil {
-		cachedPass = strings.TrimSpace(string(pw))
-	} else {
-		cachedPass = ""
+	// Try common passphrase file locations (non-interactive). If none found, assume empty passphrase.
+	candidates := []string{}
+	if kd := os.Getenv("KEYS_DIR"); kd != "" {
+		candidates = append(candidates, filepath.Join(kd, "passphrase.txt"))
 	}
+	candidates = append(candidates,
+		"./.well-known/httpe/passphrase.txt",
+		"./keys/passphrase.txt",
+	)
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "passphrase.txt"))
+	}
+	for _, c := range candidates {
+		if b, err := os.ReadFile(c); err == nil {
+			cachedPass = strings.TrimSpace(string(b))
+			passLoaded = true
+			return cachedPass
+		}
+	}
+
+	// Fallback to empty (no prompt in server mode)
+	cachedPass = ""
 	passLoaded = true
 	return cachedPass
 }

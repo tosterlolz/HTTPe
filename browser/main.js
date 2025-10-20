@@ -3,6 +3,12 @@ const path = require('path')
 const fs = require('fs')
 const openpgp = require('openpgp')
 const fetch = require('node-fetch')
+let SocksProxyAgent
+try {
+  SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent || require('socks-proxy-agent')
+} catch (e) {
+  SocksProxyAgent = null
+}
 
 let mainWindow
 
@@ -166,9 +172,100 @@ app.whenReady().then(() => {
         format: 'binary'
       })
 
+      // Map common example hostnames or empty host to localhost for local dev convenience
+      let targetHost = url.hostname || 'localhost'
+      if (targetHost === 'example.com' || targetHost === 'example.local' || targetHost === 'example') {
+        targetHost = 'localhost'
+      }
       // post to server over http on port 533 by convention
-      const target = `http://${url.hostname}:533${url.pathname}${url.search}`
-      const res = await fetch(target, { method: 'POST', body: Buffer.from(encrypted), headers: { 'Content-Type': 'application/httpe+pgp' } })
+      const target = `http://${targetHost}:533${url.pathname}${url.search}`
+      console.log('HTTPE request target ->', target, '(original host:', url.hostname, ')')
+
+      // If there is no upload data (i.e. this was a navigation / GET), perform a plain HTTP GET
+      // for remote hosts, but prefer the local TCP protocol for localhost to keep the page off the clear web.
+      if (!ciphertext) {
+        try {
+          if (targetHost === 'localhost' || targetHost === '127.0.0.1') {
+            // Use local TCP protocol
+            const net = require('net')
+            const tcpAddr = process.env.HTTPE_TCP_ADDR || '127.0.0.1:5533'
+            const [tcpHost, tcpPort] = tcpAddr.split(':')
+            const conn = net.createConnection({ host: tcpHost, port: Number(tcpPort) })
+            conn.setTimeout(3000)
+            const header = JSON.stringify({ method: 'GET', path: url.pathname || '/', body_len: 0 }) + '\n'
+            await new Promise((resolve, reject) => {
+              conn.once('connect', () => {
+                conn.write(header)
+              })
+              let state = 'hdr'
+              let buf = Buffer.alloc(0)
+              let expected = 0
+              conn.on('data', (chunk) => {
+                buf = Buffer.concat([buf, chunk])
+                if (state === 'hdr') {
+                  const idx = buf.indexOf('\n')
+                  if (idx !== -1) {
+                    const hdrLine = buf.slice(0, idx).toString('utf8')
+                    try {
+                      const respHdr = JSON.parse(hdrLine)
+                      expected = respHdr.length || 0
+                      state = 'body'
+                      buf = buf.slice(idx + 1)
+                      if (buf.length >= expected) {
+                        const body = buf.slice(0, expected)
+                        const contentType = respHdr.content_type || 'text/html'
+                        respond({ mimeType: contentType, data: body, headers: {} })
+                        conn.end()
+                        resolve()
+                      }
+                    } catch (e) {
+                      conn.end()
+                      reject(e)
+                    }
+                  }
+                } else if (state === 'body') {
+                  if (buf.length >= expected) {
+                    const body = buf.slice(0, expected)
+                    respond({ mimeType: 'text/html', data: body, headers: {} })
+                    conn.end()
+                    resolve()
+                  }
+                }
+              })
+              conn.on('error', (e) => reject(e))
+              conn.on('timeout', () => { conn.end(); reject(new Error('tcp timeout')) })
+            })
+            return
+          } else {
+            // If target is an .onion address or HTTPE_USE_TOR is enabled, route via Tor SOCKS5
+            let agent = undefined
+            const useTor = process.env.HTTPE_USE_TOR === 'true' || (url.hostname && url.hostname.endsWith('.onion'))
+            if (useTor && SocksProxyAgent) {
+              const torSocks = process.env.TOR_SOCKS || 'socks5h://127.0.0.1:9050'
+              agent = new SocksProxyAgent(torSocks)
+              console.log('Using Tor SOCKS proxy', torSocks, 'for', target)
+            }
+            const plainRes = await fetch(target, { method: 'GET', agent })
+            const buf = await plainRes.arrayBuffer()
+            let contentType = plainRes.headers.get('content-type') || ''
+            const textBody = Buffer.from(buf).toString('utf8')
+            if (!/html/i.test(contentType) && /<!doctype|<html|<body|<div|<pre/i.test(textBody)) {
+              contentType = 'text/html'
+            }
+            const headers = {}
+            const sig = plainRes.headers.get('HTTPE-Signature')
+            if (sig) headers['HTTPE-Signature'] = sig
+            respond({ mimeType: contentType, data: Buffer.from(buf), headers })
+            return
+          }
+        } catch (err) {
+          respond({ mimeType: 'text/plain', data: Buffer.from('Error fetching page: ' + err.toString()) })
+          return
+        }
+      }
+
+  const postAgent = (process.env.HTTPE_USE_TOR === 'true' || (url.hostname && url.hostname.endsWith('.onion'))) && SocksProxyAgent ? new SocksProxyAgent(process.env.TOR_SOCKS || 'socks5h://127.0.0.1:9050') : undefined
+  const res = await fetch(target, { method: 'POST', body: Buffer.from(encrypted), headers: { 'Content-Type': 'application/httpe+pgp' }, agent: postAgent })
       const data = await res.arrayBuffer()
       // Try to decrypt the response using our client private key and return plaintext to the renderer
       try {

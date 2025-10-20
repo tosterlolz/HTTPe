@@ -12,20 +12,68 @@
 </head>
 <body>
   <div id="controls">
-    <input id="url" type="text" value="httpe://localhost/" style="width:70%">
+  <input id="url" type="text" value="httpe://localhost:533/" style="width:70%">
     <button id="go">Go</button>
   </div>
-  <iframe id="frame"></iframe>
+  <div id="frameWrap" style="position:relative">
+    <iframe id="frame"></iframe>
+    <div id="status" style="position:absolute; left:8px; top:8px; background:rgba(0,0,0,0.6); color:#fff; padding:6px 10px; border-radius:6px; display:none">Loading…</div>
+  </div>
 
   <script>
     const urlInput = document.getElementById('url')
     const go = document.getElementById('go')
     const frame = document.getElementById('frame')
+    const status = document.getElementById('status')
+
+    function normalizeUrl(raw) {
+      let u = raw.trim()
+      if (!u) return u
+      try {
+        const parsed = new URL(u)
+        if (parsed.protocol === 'httpe:' && !parsed.port) parsed.port = '533'
+        return parsed.toString()
+      } catch (e) {
+        if (!u.includes('://')) u = 'httpe://' + u
+        try {
+          const p2 = new URL(u)
+          if (p2.protocol === 'httpe:' && !p2.port) p2.port = '533'
+          return p2.toString()
+        } catch (e) {
+          return raw
+        }
+      }
+    }
+
+    function setFrameSrc(u) {
+      if (!u) return
+      status.style.display = 'block'
+      status.textContent = 'Loading…'
+      // set a timeout in case load never fires
+      let timedOut = false
+      const to = setTimeout(() => {
+        timedOut = true
+        status.textContent = 'Load timed out — check server or URL'
+        status.style.background = 'rgba(200,60,60,0.9)'
+      }, 6000)
+      frame.onload = () => {
+        if (!timedOut) {
+          clearTimeout(to)
+          status.style.display = 'none'
+        }
+      }
+      frame.src = u
+    }
 
     go.addEventListener('click', () => {
-      const u = urlInput.value
-      // load via registered protocol
-      frame.src = u
+      const u = normalizeUrl(urlInput.value)
+      setFrameSrc(u)
+    })
+
+    // auto-load on start
+    window.addEventListener('DOMContentLoaded', () => {
+      const u = normalizeUrl(urlInput.value)
+      setFrameSrc(u)
     })
   </script>
 </body>

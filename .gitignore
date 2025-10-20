@@ -7,3 +7,5 @@ client/browser/node_modules/
 .DS_Store
 .env
 .vscode/
+keys/
+.well-known/
